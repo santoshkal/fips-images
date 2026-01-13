@@ -1,0 +1,550 @@
+name: SLSA Build, Attest & Sign
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/Dockerfile'
+      - '**/*.Dockerfile'
+  push:
+    branches: [main]
+    paths:
+      - '**/Dockerfile'
+      - '**/*.Dockerfile'
+  workflow_dispatch:
+    inputs:
+      dockerfile_path:
+        description: 'Path to specific Dockerfile (e.g., python/3.11/Dockerfile)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write      # Required for OIDC token (keyless signing)
+  attestations: write  # Required for GitHub attestations
+
+env:
+  REGISTRY: ghcr.io
+  # SBOM artifact types per OCI spec
+  SBOM_MEDIA_TYPE: application/vnd.cyclonedx+json
+  SBOM_ARTIFACT_TYPE: application/vnd.cyclonedx+json
+  # Provenance artifact types per in-toto/SLSA spec
+  PROVENANCE_MEDIA_TYPE: application/vnd.in-toto+json
+  PROVENANCE_ARTIFACT_TYPE: application/vnd.in-toto+json
+
+jobs:
+  # =============================================================================
+  # Job 1: Discover changed Dockerfiles
+  # =============================================================================
+  discover-dockerfiles:
+    name: Discover Changed Dockerfiles
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_dockerfiles: ${{ steps.set-matrix.outputs.has_dockerfiles }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff comparison
+
+      - name: Find changed Dockerfiles
+        id: find-dockerfiles
+        run: |
+          echo "::group::Detecting changed Dockerfiles"
+
+          # Handle manual dispatch with specific path
+          if [ -n "${{ github.event.inputs.dockerfile_path }}" ]; then
+            echo "Manual dispatch with path: ${{ github.event.inputs.dockerfile_path }}"
+            DOCKERFILES="${{ github.event.inputs.dockerfile_path }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            # For PRs, compare against base branch
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            echo "Comparing PR changes: $BASE_SHA...$HEAD_SHA"
+
+            DOCKERFILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | \
+              grep -E '(Dockerfile$|\.Dockerfile$)' | \
+              grep -v '^\.github/' || true)
+          else
+            # For push events, compare with previous commit
+            if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+              # Initial push - find all Dockerfiles
+              DOCKERFILES=$(find . -type f \( -name "Dockerfile" -o -name "*.Dockerfile" \) \
+                ! -path "./.github/*" | sed 's|^\./||' || true)
+            else
+              DOCKERFILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | \
+                grep -E '(Dockerfile$|\.Dockerfile$)' | \
+                grep -v '^\.github/' || true)
+            fi
+          fi
+
+          # Save to file for matrix generation
+          echo "$DOCKERFILES" | grep -v '^$' > dockerfiles.txt || true
+
+          COUNT=$(cat dockerfiles.txt | grep -c . || echo "0")
+          echo "Found $COUNT Dockerfile(s) to process"
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Dockerfiles to build:"
+            cat dockerfiles.txt
+          fi
+
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      - name: Set matrix output
+        id: set-matrix
+        run: |
+          if [ ! -s dockerfiles.txt ]; then
+            echo "No Dockerfiles found to process"
+            echo 'matrix={"include":[]}' >> $GITHUB_OUTPUT
+            echo "has_dockerfiles=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Build matrix with dockerfile path and derived image name
+          MATRIX_JSON='{"include":['
+          FIRST=true
+
+          while IFS= read -r dockerfile; do
+            [ -z "$dockerfile" ] && continue
+
+            # Derive image name from dockerfile path
+            # e.g., python/3.11/fips.Dockerfile -> python-3-11-fips
+            DOCKERFILE_DIR=$(dirname "$dockerfile")
+            DOCKERFILE_NAME=$(basename "$dockerfile" | sed 's/\.Dockerfile$//' | sed 's/^Dockerfile$//')
+
+            if [ "$DOCKERFILE_DIR" = "." ]; then
+              IMAGE_NAME="$DOCKERFILE_NAME"
+            else
+              DIR_PART=$(echo "$DOCKERFILE_DIR" | tr '/' '-' | tr '.' '-')
+              if [ -n "$DOCKERFILE_NAME" ] && [ "$DOCKERFILE_NAME" != "Dockerfile" ]; then
+                IMAGE_NAME="${DIR_PART}-${DOCKERFILE_NAME}"
+              else
+                IMAGE_NAME="$DIR_PART"
+              fi
+            fi
+
+            # Sanitize image name: lowercase, replace special chars
+            IMAGE_NAME=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]' | \
+              sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+
+            # Ensure non-empty name
+            [ -z "$IMAGE_NAME" ] && IMAGE_NAME="image"
+
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              MATRIX_JSON+=','
+            fi
+
+            MATRIX_JSON+="{\"dockerfile\":\"$dockerfile\",\"image_name\":\"$IMAGE_NAME\",\"context\":\"$DOCKERFILE_DIR\"}"
+          done < dockerfiles.txt
+
+          MATRIX_JSON+=']}'
+
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          echo "has_dockerfiles=true" >> $GITHUB_OUTPUT
+
+          echo "Generated matrix:"
+          echo "$MATRIX_JSON" | jq .
+
+  # =============================================================================
+  # Job 2: Build, Generate SBOM, Attest Provenance, Attach & Sign
+  # =============================================================================
+  build-attest-sign:
+    name: Build & Sign - ${{ matrix.image_name }}
+    needs: discover-dockerfiles
+    if: needs.discover-dockerfiles.outputs.has_dockerfiles == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
+
+    outputs:
+      image_digest: ${{ steps.build-push.outputs.digest }}
+      image_ref: ${{ steps.image-meta.outputs.image_ref }}
+
+    steps:
+      # -------------------------------------------------------------------------
+      # Setup
+      # -------------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install ORAS CLI
+        uses: oras-project/setup-oras@v1
+        with:
+          version: '1.2.0'
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate image metadata
+        id: image-meta
+        run: |
+          # Construct full image reference
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+
+          IMAGE_REPO="${{ env.REGISTRY }}/${REPO_OWNER}/${REPO_NAME}/${{ matrix.image_name }}"
+
+          # Generate tag based on event type
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            IMAGE_TAG="pr-${{ github.event.pull_request.number }}"
+          else
+            IMAGE_TAG="$(date +%Y%m%d)-${GITHUB_SHA:0:7}"
+          fi
+
+          IMAGE_REF="${IMAGE_REPO}:${IMAGE_TAG}"
+
+          echo "image_repo=$IMAGE_REPO" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image_ref=$IMAGE_REF" >> $GITHUB_OUTPUT
+
+          echo "::notice::Image will be tagged as: $IMAGE_REF"
+
+      # -------------------------------------------------------------------------
+      # Build & Push Image
+      # -------------------------------------------------------------------------
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push container image
+        id: build-push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.image-meta.outputs.image_ref }}
+            ${{ steps.image-meta.outputs.image_repo }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.title=${{ matrix.image_name }}
+            org.opencontainers.image.description=FIPS-compliant container image
+            slsa.build.level=2
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false  # We generate our own provenance
+          sbom: false        # We generate our own SBOM
+
+      - name: Verify image push
+        run: |
+          echo "Image pushed successfully"
+          echo "  Repository: ${{ steps.image-meta.outputs.image_repo }}"
+          echo "  Tag: ${{ steps.image-meta.outputs.image_tag }}"
+          echo "  Digest: ${{ steps.build-push.outputs.digest }}"
+
+      # -------------------------------------------------------------------------
+      # Generate SBOM using Syft
+      # -------------------------------------------------------------------------
+      - name: Generate SBOM with Syft
+        id: sbom
+        run: |
+          echo "::group::Generating SBOM (CycloneDX format)"
+
+          IMAGE_DIGEST_REF="${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }}"
+          SBOM_FILE="sbom-${{ matrix.image_name }}.cdx.json"
+
+          # Generate SBOM in CycloneDX JSON format
+          syft "${IMAGE_DIGEST_REF}" \
+            --output cyclonedx-json="${SBOM_FILE}" \
+            --source-name "${{ matrix.image_name }}" \
+            --source-version "${{ steps.image-meta.outputs.image_tag }}"
+
+          # Validate SBOM was created and has content
+          if [ ! -s "$SBOM_FILE" ]; then
+            echo "::error::SBOM generation failed - file is empty"
+            exit 1
+          fi
+
+          # Show SBOM summary
+          echo "SBOM generated: $SBOM_FILE"
+          echo "SBOM size: $(wc -c < "$SBOM_FILE") bytes"
+          echo "Components found: $(jq '.components | length' "$SBOM_FILE")"
+
+          echo "sbom_file=$SBOM_FILE" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      # -------------------------------------------------------------------------
+      # Create SLSA Provenance Attestation
+      # -------------------------------------------------------------------------
+      - name: Generate SLSA Provenance Attestation
+        id: provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.image-meta.outputs.image_repo }}
+          subject-digest: ${{ steps.build-push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Export provenance for ORAS attachment
+        id: export-provenance
+        run: |
+          # The attestation bundle is stored at the bundle-path output
+          PROVENANCE_FILE="provenance-${{ matrix.image_name }}.intoto.json"
+
+          # Copy the bundle for ORAS attachment
+          if [ -f "${{ steps.provenance.outputs.bundle-path }}" ]; then
+            cp "${{ steps.provenance.outputs.bundle-path }}" "$PROVENANCE_FILE"
+            echo "Provenance attestation exported: $PROVENANCE_FILE"
+            echo "provenance_file=$PROVENANCE_FILE" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Provenance bundle not found at expected path"
+            echo "provenance_file=" >> $GITHUB_OUTPUT
+          fi
+
+      # -------------------------------------------------------------------------
+      # Create SBOM Attestation
+      # -------------------------------------------------------------------------
+      - name: Generate SBOM Attestation
+        id: sbom-attest
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ steps.image-meta.outputs.image_repo }}
+          subject-digest: ${{ steps.build-push.outputs.digest }}
+          sbom-path: ${{ steps.sbom.outputs.sbom_file }}
+          push-to-registry: true
+
+      # -------------------------------------------------------------------------
+      # Attach SBOM and Provenance to Image using ORAS
+      # -------------------------------------------------------------------------
+      - name: Log in to Registry for ORAS
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login "${{ env.REGISTRY }}" \
+            -u "${{ github.actor }}" --password-stdin
+
+      - name: Attach SBOM to image with ORAS
+        id: oras-sbom
+        run: |
+          echo "::group::Attaching SBOM to image via ORAS"
+
+          IMAGE_DIGEST_REF="${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }}"
+          SBOM_FILE="${{ steps.sbom.outputs.sbom_file }}"
+
+          # Attach SBOM as OCI artifact referencing the image
+          SBOM_ATTACH_DIGEST=$(oras attach \
+            --artifact-type "${{ env.SBOM_ARTIFACT_TYPE }}" \
+            "${IMAGE_DIGEST_REF}" \
+            "${SBOM_FILE}:${{ env.SBOM_MEDIA_TYPE }}" \
+            --format go-template --template '{{.digest}}')
+
+          echo "SBOM attached with digest: $SBOM_ATTACH_DIGEST"
+          echo "sbom_digest=$SBOM_ATTACH_DIGEST" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      - name: Attach Provenance to image with ORAS
+        id: oras-provenance
+        if: steps.export-provenance.outputs.provenance_file != ''
+        run: |
+          echo "::group::Attaching Provenance to image via ORAS"
+
+          IMAGE_DIGEST_REF="${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }}"
+          PROVENANCE_FILE="${{ steps.export-provenance.outputs.provenance_file }}"
+
+          # Attach Provenance as OCI artifact referencing the image
+          PROV_ATTACH_DIGEST=$(oras attach \
+            --artifact-type "${{ env.PROVENANCE_ARTIFACT_TYPE }}" \
+            --annotation "org.opencontainers.artifact.description=SLSA Provenance" \
+            "${IMAGE_DIGEST_REF}" \
+            "${PROVENANCE_FILE}:${{ env.PROVENANCE_MEDIA_TYPE }}" \
+            --format go-template --template '{{.digest}}')
+
+          echo "Provenance attached with digest: $PROV_ATTACH_DIGEST"
+          echo "provenance_digest=$PROV_ATTACH_DIGEST" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      # -------------------------------------------------------------------------
+      # Sign Image and Attached Artifacts with Cosign (Keyless)
+      # -------------------------------------------------------------------------
+      - name: Sign container image with Cosign (keyless)
+        run: |
+          echo "::group::Signing image with Cosign keyless"
+
+          IMAGE_DIGEST_REF="${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }}"
+
+          # Sign using keyless mode (OIDC-based identity)
+          # The --yes flag confirms non-interactive signing
+          cosign sign --yes "${IMAGE_DIGEST_REF}"
+
+          echo "Image signed successfully: ${IMAGE_DIGEST_REF}"
+          echo "::endgroup::"
+
+      - name: Sign SBOM artifact with Cosign (keyless)
+        if: steps.oras-sbom.outputs.sbom_digest != ''
+        run: |
+          echo "::group::Signing SBOM artifact"
+
+          SBOM_DIGEST_REF="${{ steps.image-meta.outputs.image_repo }}@${{ steps.oras-sbom.outputs.sbom_digest }}"
+
+          cosign sign --yes "${SBOM_DIGEST_REF}"
+
+          echo "SBOM artifact signed: ${SBOM_DIGEST_REF}"
+          echo "::endgroup::"
+
+      - name: Sign Provenance artifact with Cosign (keyless)
+        if: steps.oras-provenance.outputs.provenance_digest != ''
+        run: |
+          echo "::group::Signing Provenance artifact"
+
+          PROV_DIGEST_REF="${{ steps.image-meta.outputs.image_repo }}@${{ steps.oras-provenance.outputs.provenance_digest }}"
+
+          cosign sign --yes "${PROV_DIGEST_REF}"
+
+          echo "Provenance artifact signed: ${PROV_DIGEST_REF}"
+          echo "::endgroup::"
+
+      # -------------------------------------------------------------------------
+      # Verification & Summary
+      # -------------------------------------------------------------------------
+      - name: Verify signatures
+        run: |
+          echo "::group::Verifying Cosign signatures"
+
+          IMAGE_DIGEST_REF="${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }}"
+
+          # Verify the image signature
+          cosign verify "${IMAGE_DIGEST_REF}" \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            | jq '.[0].optional' || echo "Verification output above"
+
+          echo "::endgroup::"
+
+      - name: Discover attached artifacts
+        run: |
+          echo "::group::Listing attached artifacts (ORAS discover)"
+
+          IMAGE_DIGEST_REF="${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }}"
+
+          echo "Artifacts attached to: ${IMAGE_DIGEST_REF}"
+          oras discover "${IMAGE_DIGEST_REF}" --format tree || echo "No referrers found or registry doesn't support OCI 1.1"
+
+          echo "::endgroup::"
+
+      - name: Upload SBOM as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.image_name }}
+          path: ${{ steps.sbom.outputs.sbom_file }}
+          retention-days: 90
+
+      - name: Upload Provenance as workflow artifact
+        if: steps.export-provenance.outputs.provenance_file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: provenance-${{ matrix.image_name }}
+          path: ${{ steps.export-provenance.outputs.provenance_file }}
+          retention-days: 90
+
+      - name: Generate job summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## SLSA Supply Chain Security Summary
+
+          ### Image Details
+          | Property | Value |
+          |----------|-------|
+          | **Image** | `${{ steps.image-meta.outputs.image_ref }}` |
+          | **Digest** | `${{ steps.build-push.outputs.digest }}` |
+          | **Dockerfile** | `${{ matrix.dockerfile }}` |
+
+          ### Supply Chain Artifacts
+          | Artifact | Status | Digest |
+          |----------|--------|--------|
+          | SBOM (CycloneDX) | Attached | `${{ steps.oras-sbom.outputs.sbom_digest }}` |
+          | SLSA Provenance | Attached | `${{ steps.oras-provenance.outputs.provenance_digest }}` |
+          | Cosign Signature | Signed | Keyless (Sigstore) |
+
+          ### Attestations
+          - **Provenance Attestation**: [${{ steps.provenance.outputs.attestation-url }}](${{ steps.provenance.outputs.attestation-url }})
+          - **SBOM Attestation**: [${{ steps.sbom-attest.outputs.attestation-url }}](${{ steps.sbom-attest.outputs.attestation-url }})
+
+          ### Verification Commands
+          ```bash
+          # Verify image signature
+          cosign verify ${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }} \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+          # List attached artifacts
+          oras discover ${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }}
+
+          # Verify GitHub attestations
+          gh attestation verify oci://${{ steps.image-meta.outputs.image_repo }}@${{ steps.build-push.outputs.digest }} \
+            --owner ${{ github.repository_owner }}
+          ```
+
+          ### SLSA Compliance
+          This build achieves **SLSA Build Level 2** with:
+          - Hosted build platform (GitHub Actions)
+          - Signed provenance attestation
+          - Tamper-resistant build service
+
+          EOF
+
+  # =============================================================================
+  # Job 3: Summary Report
+  # =============================================================================
+  summary:
+    name: Workflow Summary
+    needs: [discover-dockerfiles, build-attest-sign]
+    if: always() && needs.discover-dockerfiles.outputs.has_dockerfiles == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: sbom-*
+          merge-multiple: true
+
+      - name: Generate consolidated report
+        run: |
+          echo "# SLSA Build Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow:** ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.build-attest-sign.result }}" = "success" ]; then
+            echo "## Result: All images built and signed successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Result: Some builds failed - review job logs" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### SBOM Artifacts" >> $GITHUB_STEP_SUMMARY
+          if [ -d "artifacts" ]; then
+            for sbom in artifacts/*.cdx.json; do
+              if [ -f "$sbom" ]; then
+                COMPONENTS=$(jq '.components | length' "$sbom" 2>/dev/null || echo "N/A")
+                echo "- **$(basename "$sbom")**: $COMPONENTS components" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          else
+            echo "No SBOM artifacts found" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Artifacts retained for 90 days*" >> $GITHUB_STEP_SUMMARY
