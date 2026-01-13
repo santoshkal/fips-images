@@ -34,7 +34,7 @@ ARG PYTHON_VERSION="3.10.13"
 
 WORKDIR /fips
 
-# Copy patched Python source from patch stage
+# Copy patched Python source from patch stage generated 
 COPY --from=patch /fips/Python-${PYTHON_VERSION} ./Python-${PYTHON_VERSION}
 
 # Install build dependencies
