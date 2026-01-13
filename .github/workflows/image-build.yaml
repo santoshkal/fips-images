@@ -1,0 +1,132 @@
+
+name: Build, push image, SBOM (Grype), ORAS push+attach SBOM, Cosign sign
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**/fips-Dockerfile'
+
+permissions:
+  contents: read
+  packages: write     # push to GHCR
+  id-token: write     # keyless cosign
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_REPO: open-containers/fips-container-images/python
+  IMAGE_TAG: 3.10.9-fips
+  DOCKERFILE_PATH: openssl/3.1.2/alpine/3.2.1/python/3.10/fips-dockerfile
+  BUILD_CONTEXT: openssl/3.1.2/alpine/3.2.1/python/3.10
+
+  # SBOM settings
+  SBOM_FILE: sbom.cdx.json
+  SBOM_TAG_SUFFIX: sbom
+  # CycloneDX JSON media type commonly used for SBOM artifacts
+  SBOM_MEDIA_TYPE: application/vnd.cyclonedx+json
+  SBOM_ARTIFACT_TYPE: application/vnd.cyclonedx+json
+
+jobs:
+  build-push-sbom-attach-sign:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Install Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Log in to GHCR (Docker)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # - name: Log in to GHCR (ORAS)
+      #   run: |
+      #     echo "${{ secrets.GITHUB_TOKEN }}" | oras login "${{ env.REGISTRY }}" \
+      #       -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push image
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
+        run: |
+          docker buildx build \
+            --file "${{ env.DOCKERFILE_PATH }}" \
+            --tag "${IMAGE_REF}" \
+            --push \
+            "${{ env.BUILD_CONTEXT }}"
+
+      - name: Resolve pushed image digest
+        id: imgdigest
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
+        run: |
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE_REF}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image digest: ${DIGEST}"
+
+      - name: Generate SBOM (CycloneDX JSON) with Grype
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
+        run: |
+          grype "registry:${IMAGE_REF}" -o cyclonedx-json > "${{ env.SBOM_FILE }}"
+          test -s "${{ env.SBOM_FILE }}"
+
+      - name: ORAS push SBOM as its own OCI artifact tag
+        env:
+          SBOM_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}-${{ env.SBOM_TAG_SUFFIX }}
+        run: |
+          # oras push pushes files as OCI artifacts. :contentReference[oaicite:1]{index=1}
+          oras push \
+            --artifact-type "${{ env.SBOM_ARTIFACT_TYPE }}" \
+            "${SBOM_REF}" \
+            "${{ env.SBOM_FILE }}:${{ env.SBOM_MEDIA_TYPE }}"
+
+      - name: ORAS attach SBOM to the image (as referrer)
+        id: attach
+        env:
+          IMAGE_SUBJECT: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}@${{ steps.imgdigest.outputs.digest }}
+        run: |
+          # oras attach attaches files to an existing artifact (the image digest here). :contentReference[oaicite:2]{index=2}
+          # Capture the attached artifact digest for signing.
+          ATTACH_DIGEST="$(oras attach \
+            --artifact-type "${{ env.SBOM_ARTIFACT_TYPE }}" \
+            "${IMAGE_SUBJECT}" \
+            "${{ env.SBOM_FILE }}:${{ env.SBOM_MEDIA_TYPE }}" \
+            --format go-template --template "{{.digest}}")"
+
+          echo "sbom_digest=${ATTACH_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Attached SBOM digest: ${ATTACH_DIGEST}"
+
+      - name: Cosign sign the image (keyless)
+        env:
+          IMAGE_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}@${{ steps.imgdigest.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE_DIGEST_REF}"
+
+      - name: Cosign sign the attached SBOM artifact (keyless)
+        env:
+          SBOM_DIGEST_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}@${{ steps.attach.outputs.sbom_digest }}
+        run: |
+          cosign sign --yes "${SBOM_DIGEST_REF}"
+
+      - name: Upload SBOM artifact to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: ${{ env.SBOM_FILE }}
