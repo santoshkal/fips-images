@@ -4,11 +4,11 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - '**/Fips.Dockerfile'
+      - 'openssl/**/python/**'
   push:
     branches: [main]
     paths:
-      - '**/Fips.Dockerfile'
+      - 'openssl/**/python/**'
   workflow_dispatch:
     inputs:
       dockerfile_path:
@@ -47,27 +47,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Find changed Dockerfiles
+      - name: Find affected Dockerfiles
         id: set-matrix
         run: |
+          DOCKERFILES=""
+
           # Handle manual dispatch
           if [ -n "${{ github.event.inputs.dockerfile_path }}" ]; then
             DOCKERFILES="${{ github.event.inputs.dockerfile_path }}"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            DOCKERFILES=$(git diff --name-only \
+            CHANGED_FILES=$(git diff --name-only \
               "${{ github.event.pull_request.base.sha }}" \
               "${{ github.event.pull_request.head.sha }}" | \
-              grep 'Fips\.Dockerfile$' | \
-              grep -v '^\.github/' || true)
+              grep '^openssl/.*/python/' || true)
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            # Initial commit - find all Dockerfiles under python directories
+            DOCKERFILES=$(find . -type f -name "Fips.Dockerfile" \
+              -path "*/python/*" | sed 's|^\./||' || true)
           else
-            if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
-              DOCKERFILES=$(find . -type f -name "Fips.Dockerfile" \
-                ! -path "./.github/*" | sed 's|^\./||' || true)
-            else
-              DOCKERFILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | \
-                grep 'Fips\.Dockerfile$' | \
-                grep -v '^\.github/' || true)
-            fi
+            CHANGED_FILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | \
+              grep '^openssl/.*/python/' || true)
+          fi
+
+          # Build Dockerfile list from changed files (deduplicated by directory)
+          if [ -n "$CHANGED_FILES" ] && [ -z "$DOCKERFILES" ]; then
+            DOCKERFILES=$(echo "$CHANGED_FILES" | while read -r file; do
+              dirname "$file"
+            done | sort -u | while read -r dir; do
+              echo "${dir}/Fips.Dockerfile"
+            done | xargs)
           fi
 
           # Build matrix
@@ -217,6 +225,8 @@ jobs:
       # Step 6: Verify Attestations
       # -----------------------------------------------------------------------
       - name: Verify SBOM attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "Verifying SBOM attestation..."
           gh attestation verify \
@@ -226,6 +236,8 @@ jobs:
           echo "SBOM attestation verified successfully"
 
       - name: Verify SLSA Provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "Verifying SLSA Provenance attestation..."
           gh attestation verify \
