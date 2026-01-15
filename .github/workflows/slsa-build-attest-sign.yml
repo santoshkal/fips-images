@@ -4,13 +4,11 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - '**/Dockerfile'
-      - '**/*.Dockerfile'
+      - '**/Fips.Dockerfile'
   push:
     branches: [main]
     paths:
-      - '**/Dockerfile'
-      - '**/*.Dockerfile'
+      - '**/Fips.Dockerfile'
   workflow_dispatch:
     inputs:
       dockerfile_path:
@@ -59,15 +57,15 @@ jobs:
             DOCKERFILES=$(git diff --name-only \
               "${{ github.event.pull_request.base.sha }}" \
               "${{ github.event.pull_request.head.sha }}" | \
-              grep -E '(Dockerfile$|\.Dockerfile$)' | \
+              grep 'Fips\.Dockerfile$' | \
               grep -v '^\.github/' || true)
           else
             if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
-              DOCKERFILES=$(find . -type f \( -name "Dockerfile" -o -name "*.Dockerfile" \) \
+              DOCKERFILES=$(find . -type f -name "Fips.Dockerfile" \
                 ! -path "./.github/*" | sed 's|^\./||' || true)
             else
               DOCKERFILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | \
-                grep -E '(Dockerfile$|\.Dockerfile$)' | \
+                grep 'Fips\.Dockerfile$' | \
                 grep -v '^\.github/' || true)
             fi
           fi
@@ -86,13 +84,12 @@ jobs:
             [ -z "$dockerfile" ] && continue
 
             CONTEXT=$(dirname "$dockerfile")
-            NAME=$(basename "$dockerfile" | sed 's/\.Dockerfile$//' | sed 's/^Dockerfile$//')
 
+            # Use directory path as image name (since all files are now Fips.Dockerfile)
             if [ "$CONTEXT" = "." ]; then
-              IMAGE_NAME="${NAME:-image}"
+              IMAGE_NAME="fips-image"
             else
-              DIR_PART=$(echo "$CONTEXT" | tr '/' '-' | tr '.' '-')
-              IMAGE_NAME="${DIR_PART}${NAME:+-$NAME}"
+              IMAGE_NAME=$(echo "$CONTEXT" | tr '/' '-' | tr '.' '-')
             fi
 
             IMAGE_NAME=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]' | \
