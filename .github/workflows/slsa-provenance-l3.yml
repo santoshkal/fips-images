@@ -56,15 +56,23 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.workflow_run.id }}
 
+      - name: List downloaded artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          ls -la metadata/ || echo "No metadata directory"
+
       - name: Check which images were built
         id: check
         run: |
           # Check for each Python version
           for ver in 39 310 311 312 313 314; do
             pattern="python-${ver:0:1}-${ver:1}"
-            if ls metadata/*${pattern}*.json 2>/dev/null | head -1; then
+            # Use find to check if matching files exist (ls | head always returns 0)
+            if find metadata -name "*${pattern}*.json" 2>/dev/null | grep -q .; then
+              echo "Found metadata for Python ${ver:0:1}.${ver:1}"
               echo "python_${ver}=true" >> $GITHUB_OUTPUT
             else
+              echo "No metadata for Python ${ver:0:1}.${ver:1}"
               echo "python_${ver}=false" >> $GITHUB_OUTPUT
             fi
           done
@@ -74,7 +82,7 @@ jobs:
         run: |
           for ver in 39 310 311 312 313 314; do
             pattern="python-${ver:0:1}-${ver:1}"
-            file=$(ls metadata/*${pattern}*.json 2>/dev/null | head -1 || echo "")
+            file=$(find metadata -name "*${pattern}*.json" 2>/dev/null | head -1 || echo "")
             if [ -n "$file" ] && [ -f "$file" ]; then
               image=$(jq -r '.image_repo' "$file")
               digest=$(jq -r '.digest' "$file")
