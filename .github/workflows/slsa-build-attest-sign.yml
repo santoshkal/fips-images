@@ -191,7 +191,7 @@ jobs:
 
       - name: Attest SBOM
         uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2.4.0
-        id: attest
+        id: attest-sbom
         with:
           subject-name: ${{ steps.meta.outputs.image_repo }}
           subject-digest: ${{ steps.push.outputs.digest }}
@@ -199,23 +199,52 @@ jobs:
           push-to-registry: true
 
       # -----------------------------------------------------------------------
-      # Step 4: Sign Image and SBOM with Cosign (keyless)
+      # Step 4: Generate SLSA Provenance Attestation
+      # -----------------------------------------------------------------------
+      - name: Generate SLSA Provenance
+        uses: actions/attest-build-provenance@v2
+        id: attest-provenance
+        with:
+          subject-name: ${{ steps.meta.outputs.image_repo }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # -----------------------------------------------------------------------
+      # Step 5: Sign Image with Cosign (keyless)
       # -----------------------------------------------------------------------
       - name: Sign image with Cosign
         run: |
           cosign sign --yes "${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }}"
 
-      - name: Sign SBOM attestation with Cosign
+      # -----------------------------------------------------------------------
+      # Step 6: Verify Attestations
+      # -----------------------------------------------------------------------
+      - name: Verify SBOM attestation
         run: |
-          # Get the SBOM attestation digest from the bundle and sign it
-          ATTESTATION_DIGEST=$(jq -r '.verificationMaterial.tlogEntries[0].inclusionProof.checkpoint' \
-            "${{ steps.attest.outputs.bundle-path }}" 2>/dev/null || true)
+          echo "Verifying SBOM attestation..."
+          gh attestation verify \
+            oci://${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }} \
+            --repo ${{ github.repository }} \
+            --predicate-type https://cyclonedx.org/bom
+          echo "SBOM attestation verified successfully"
 
-          # The attestation is already signed by Sigstore via attest-sbom action
-          # We can additionally sign the bundle file if needed
-          if [ -f "${{ steps.attest.outputs.bundle-path }}" ]; then
-            echo "SBOM attestation created and signed at: ${{ steps.attest.outputs.attestation-url }}"
-          fi
+      - name: Verify SLSA Provenance attestation
+        run: |
+          echo "Verifying SLSA Provenance attestation..."
+          gh attestation verify \
+            oci://${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }} \
+            --repo ${{ github.repository }} \
+            --predicate-type https://slsa.dev/provenance/v1
+          echo "SLSA Provenance attestation verified successfully"
+
+      - name: Verify Cosign signature
+        run: |
+          echo "Verifying Cosign signature..."
+          cosign verify \
+            ${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }} \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+          echo "Cosign signature verified successfully"
 
       # -----------------------------------------------------------------------
       # Summary
@@ -236,18 +265,34 @@ jobs:
           |----------|-------|
           | **Image** | \`${{ steps.meta.outputs.image_ref }}\` |
           | **Digest** | \`${{ steps.push.outputs.digest }}\` |
-          | **SBOM Attestation** | [${{ steps.attest.outputs.attestation-id }}](${{ steps.attest.outputs.attestation-url }}) |
+          | **SBOM Attestation** | [${{ steps.attest-sbom.outputs.attestation-id }}](${{ steps.attest-sbom.outputs.attestation-url }}) |
+          | **SLSA Provenance** | [${{ steps.attest-provenance.outputs.attestation-id }}](${{ steps.attest-provenance.outputs.attestation-url }}) |
           | **Cosign Signed** | Yes (keyless) |
+          | **SLSA Build Level** | L2 |
+          | **Verification** | Passed |
 
-          ### Verify Commands
+          ### Verify Commands (run locally)
           \`\`\`bash
+          # Verify SBOM attestation (CycloneDX)
+          gh attestation verify oci://${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }} \\
+            --repo ${{ github.repository }} \\
+            --predicate-type https://cyclonedx.org/bom
+
+          # Verify SLSA Provenance attestation
+          gh attestation verify oci://${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }} \\
+            --repo ${{ github.repository }} \\
+            --predicate-type https://slsa.dev/provenance/v1
+
           # Verify Cosign signature
           cosign verify ${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }} \\
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \\
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
 
-          # Verify GitHub attestation
-          gh attestation verify oci://${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }} \\
-            --owner ${{ github.repository_owner }}
+          # Verify SLSA Provenance with Cosign
+          cosign verify-attestation ${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }} \\
+            --type https://slsa.dev/provenance/v1 \\
+            --certificate-identity-regexp="^https://github.com/${{ github.repository }}/.github/workflows/.*" \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+            --new-bundle-format
           \`\`\`
           EOF

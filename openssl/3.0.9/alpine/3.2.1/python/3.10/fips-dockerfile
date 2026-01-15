@@ -204,7 +204,7 @@ LABEL maintainer="DevOps Team" \
       org.opencontainers.image.title="Python FIPS Alpine" \
       org.opencontainers.image.description="FIPS 140-2 compliant Python runtime on Alpine Linux" \
       org.opencontainers.image.version="${PYTHON_VERSION}" \
-      org.opencontainers.image.vendor="Your Organization"
+      org.opencontainers.image.vendor="Capten.ai"
 
 # Install minimal runtime dependencies and apply security updates
 RUN apk add --no-cache \
