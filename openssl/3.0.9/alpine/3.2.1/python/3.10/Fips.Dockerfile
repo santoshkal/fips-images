@@ -25,7 +25,7 @@ RUN apk add --no-cache \
   && rm -f Python-${PYTHON_VERSION}.tgz
 
 # ------------------------------------------------------------------------------
-# Stage 2: Build Stage - Compile OpenSSL FIPS and Python
+# Stage 2: Build Stage - Compile OpenSSL FIPS and Python from source
 # ------------------------------------------------------------------------------
 FROM alpine:3.21 AS build
 
